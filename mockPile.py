@@ -7,7 +7,7 @@ from datetime import datetime, timedelta
 
 # ---------------- 默认配置（可用命令行参数覆盖，见 --help） ----------------
 SERVER_HOST = '127.0.0.1'  # 云平台 IP
-SERVER_PORT = 8882         # 云平台端口
+SERVER_PORT = 8888         # 云平台端口
 PILE_SN = b'\x77\x03\x10\x00\x00\x18\x05'  # 桩编码 BCD 7字节（示例桩号 77031000000001）
 
 GUN_COUNT = 2
@@ -248,8 +248,21 @@ def heartbeat():
     return build_frame(CMD_HEARTBEAT, body)
 
 
+def pack_bcd_number(value: int, byte_length: int) -> bytes:
+    """整数转定长BCD码，高位字节在前"""
+    if value < 0:
+        raise ValueError("BCD编号不能为负数")
+
+    digits = str(value).zfill(byte_length * 2)
+
+    if len(digits) != byte_length * 2:
+        raise ValueError("BCD编号超出长度")
+
+    return bytes.fromhex(digits)
+
+
 def bill_model_check(model_no: int = 0):
-    body = PILE_SN + struct.pack('>H', model_no)
+    body = PILE_SN + pack_bcd_number(model_no, 2)
     return build_frame(CMD_BILL_CHECK, body)
 
 
