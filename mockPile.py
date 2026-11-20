@@ -8,8 +8,8 @@ from datetime import datetime, timedelta
 # ---------------- 默认配置（可用命令行参数覆盖，见 --help） ----------------
 SERVER_HOST = '127.0.0.1'  # 云平台 IP
 SERVER_PORT = 8888         # 云平台端口
-PILE_SN = b'\x77\x03\x10\x00\x00\x18\x05'  # 桩编码 BCD 7字节（示例桩号 77031000000001）
-
+# PILE_SN = b'\x77\x03\x10\x00\x00\x18\x05'  # 桩编码 BCD 7字节（示例桩号 77031000000001）
+PILE_SN=bytes.fromhex("12345678901234")
 GUN_COUNT = 2
 GUN_NO = 2  # 当前模拟枪号（1..GUN_COUNT）
 PROTOCOL_VER = 0x0F  # 协议版本 V1.5（0x0F）
@@ -482,6 +482,60 @@ def bill_set_resp(result):
             bytes([result])
     )
     return build_frame(CMD_BILL_SET_RESP, body)
+
+
+# 各桩已收到的计费模型编号（桩号 -> BCD hex），用于打印新旧对比
+LAST_FEE_MODEL = {}
+
+FEE_TYPE_NAMES = ("尖", "峰", "平", "谷")
+
+
+def merge_fee_slots(slots):
+    """48 个半小时时段号（0=尖,1=峰,2=平,3=谷）合并为连续区间 [(start, end, type)]"""
+    merged = []
+    prev_type, start = None, 0
+    for i in range(48):
+        t = slots[i]
+        if prev_type is None:
+            prev_type, start = t, i
+        elif t != prev_type:
+            merged.append((start, i, prev_type))
+            prev_type, start = t, i
+    merged.append((start, 48, prev_type))
+    out = []
+    for s, e, t in merged:
+        sh, sm = s // 2, (s % 2) * 30
+        eh, em = (e // 2) % 24, (e % 2) * 30
+        out.append((f"{sh:02d}:{sm:02d}", f"{eh:02d}:{em:02d}", t))
+    return out
+
+
+def print_fee_model(body):
+    """解析并打印 0x58 计费模型报文（与平台 FeeResponseBuilder 的 90 字节格式对齐：
+    桩号7B + 模型编号2B + 尖峰平谷各电费/服务费4B小端 + 计损1B + 48个半小时时段号）"""
+    pile = body[0:7].hex().upper()
+    model = body[7:9].hex().upper()
+    rates = []
+    for i in range(4):
+        ele = struct.unpack('<I', body[9 + i * 8:13 + i * 8])[0] / 100000
+        srv = struct.unpack('<I', body[13 + i * 8:17 + i * 8])[0] / 100000
+        rates.append((ele, srv))
+    loss = body[41]
+    slots = list(body[42:90])
+
+    old = LAST_FEE_MODEL.get(pile)
+    diff = f"（原 {old}）" if old and old != model else "（不变）" if old else "（首次）"
+    print(f"  - 桩编码: {pile}")
+    print(f"  - 计费模型编号: {model} {diff}")
+    for i, name in enumerate(FEE_TYPE_NAMES):
+        print(f"  - {name}: 电费 {rates[i][0]:.2f} + 服务费 {rates[i][1]:.2f} 元/度")
+    print(f"  - 计损比例: {loss}")
+    segs = " | ".join(f"{s}-{e} {FEE_TYPE_NAMES[t]}" for s, e, t in merge_fee_slots(slots))
+    counts = {t: slots.count(t) for t in set(slots)}
+    dist = ", ".join(f"{FEE_TYPE_NAMES[t]}×{counts[t]}" for t in sorted(counts))
+    print(f"  - 时段: {segs}")
+    print(f"  - 分布: {dist}（共 48 个半小时）")
+    LAST_FEE_MODEL[pile] = model
 
 
 def remote_restart_resp(result):
@@ -1115,13 +1169,8 @@ def simulate_pile():
 
                     elif cmd == CMD_BILL_SET_CMD:
                         print("← 收到计费模型设置 (0x58)")
-                        if len(body) >= 61:
-                            peak_price = struct.unpack('<I', body[9:13])[0]
-                            flat_price = struct.unpack('<I', body[17:21])[0]
-                            valley_price = struct.unpack('<I', body[25:29])[0]
-                            print(f"  - 尖费率: {peak_price / 100000:.2f} 元/度")
-                            print(f"  - 平费率: {flat_price / 100000:.2f} 元/度")
-                            print(f"  - 谷费率: {valley_price / 100000:.2f} 元/度")
+                        if len(body) >= 90:
+                            print_fee_model(body)
                             with send_lock:
                                 sock.send(bill_set_resp(1))
                             print("✓ 回复计费模型设置成功")
