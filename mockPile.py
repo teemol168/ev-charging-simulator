@@ -20,7 +20,87 @@ OPERATOR = 0x04  # 其他
 
 HEARTBEAT_INTERVAL = 10  # 秒
 
-PRICE_PER_KWH = 2.0  # 实时上报电价（元/度），与 0x3B 账单 peak_price=200000（0.0001元/度）同价
+# ---- 分时费率 ----
+# 默认费率（对齐平台策略 4"泡泡海充电站"，仅在未收到平台计费模型时兜底）：
+# (起始分钟, 结束分钟, 类型, 电价, 服务费)；类型: sharp尖 / peak峰 / flat平 / valley谷
+TOU_PERIODS = [
+    (0, 480, 'valley', 0.25, 0.23),      # 谷 00:00-08:00
+    (480, 600, 'flat', 0.58, 0.16),      # 平 08:00-10:00
+    (600, 720, 'sharp', 0.98, 0.08),     # 尖 10:00-12:00
+    (720, 840, 'flat', 0.58, 0.16),      # 平 12:00-14:00
+    (840, 900, 'peak', 0.98, 0.01),      # 峰 14:00-15:00
+    (900, 1140, 'sharp', 0.98, 0.08),    # 尖 15:00-19:00
+    (1140, 1440, 'flat', 0.58, 0.16),    # 平 19:00-24:00
+]
+
+TOU_PRICES = {'sharp': (0.98, 0.08), 'peak': (0.98, 0.01),
+              'flat': (0.58, 0.16), 'valley': (0.25, 0.23)}
+
+FEE_CODE_MAP = {0: 'sharp', 1: 'peak', 2: 'flat', 3: 'valley'}   # 时段号 → 类型
+FEE_NAME_MAP = {'sharp': '尖', 'peak': '峰', 'flat': '平', 'valley': '谷'}
+
+# 全局动态费率状态：收到平台计费模型（0x0A 下发 / 0x58 设置）后更新，
+# 0x3B 账单与实时上报金额均按此计价。默认取 TOU_PERIODS/TOU_PRICES 兜底。
+ACTIVE_FEE = {
+    'model': None,                                        # 计费模型编号（BCD hex 字符串）
+    'prices': dict(TOU_PRICES),                           # 类型 -> (电价, 服务费) 元/度
+    'periods': [(s, e, t) for s, e, t, _, _ in TOU_PERIODS],  # (起始分, 结束分, 类型)
+}
+
+
+def tou_of(dt):
+    """返回 dt 所处时段 (类型, 电价, 服务费)，按平台下发的动态费率 ACTIVE_FEE 计算"""
+    m = dt.hour * 60 + dt.minute
+    for start, end, t in ACTIVE_FEE['periods']:
+        if start <= m < end:
+            price, service = ACTIVE_FEE['prices'].get(t, (0.0, 0.0))
+            return t, price, service
+    price, service = ACTIVE_FEE['prices'].get('flat', (0.58, 0.16))
+    return 'flat', price, service
+
+
+def tou_combined_price(dt):
+    """dt 时刻的合并单价（元/度），实时上报累计金额用"""
+    _, price, service = tou_of(dt)
+    return price + service
+
+
+def build_tou_bill(start_dt, end_dt, energy_kwh):
+    """按充电起止时间把电量拆到各时段，生成 0x3B 分时账单。
+
+    电量按分钟数比例分摊（模拟充电功率恒定：0.5 度/分钟）。
+    返回 {'sharp'/'peak'/'flat'/'valley': {
+        'price':  0.00001元/度, 'energy': 0.0001度, 'amount': 0.0001元, 'loss': 0.0001度}}
+    """
+    counts = {}  # 类型 -> 分钟数
+    cur = start_dt.replace(second=0, microsecond=0)
+    while cur < end_dt:
+        t, _, _ = tou_of(cur)
+        counts[t] = counts.get(t, 0) + 1
+        cur += timedelta(minutes=1)
+    total_minutes = sum(counts.values())
+    if total_minutes == 0:  # 充电不足 1 分钟，整单归入开始时刻的时段
+        t, _, _ = tou_of(start_dt)
+        counts = {t: 1}
+        total_minutes = 1
+
+    bill = {}
+    for t in ('sharp', 'peak', 'flat', 'valley'):
+        # 真实桩对四个时段都上报配置单价（即使该段电量为 0），否则平台订单单价会被写成空
+        price, service = ACTIVE_FEE['prices'].get(t, TOU_PRICES[t])
+        combined = price + service
+        n = counts.get(t, 0)
+        if n == 0:
+            bill[t] = {'price': int(round(combined * 100000)), 'energy': 0, 'amount': 0, 'loss': 0}
+            continue
+        energy_units = int(round(energy_kwh * n / total_minutes * 10000))  # 0.0001度
+        bill[t] = {
+            'price': int(round(combined * 100000)),     # 0.00001元/度（合并单价=电价+服务费）
+            'energy': energy_units,
+            'amount': int(round(energy_units * combined)),  # 0.0001元
+            'loss': 0,
+        }
+    return bill
 
 # 命令码（奇数上行，偶数下行）
 CMD_LOGIN = 0x01
@@ -489,29 +569,13 @@ LAST_FEE_MODEL = {}
 FEE_TYPE_NAMES = ("尖", "峰", "平", "谷")
 
 
-def merge_fee_slots(slots):
-    """48 个半小时时段号（0=尖,1=峰,2=平,3=谷）合并为连续区间 [(start, end, type)]"""
-    merged = []
-    prev_type, start = None, 0
-    for i in range(48):
-        t = slots[i]
-        if prev_type is None:
-            prev_type, start = t, i
-        elif t != prev_type:
-            merged.append((start, i, prev_type))
-            prev_type, start = t, i
-    merged.append((start, 48, prev_type))
-    out = []
-    for s, e, t in merged:
-        sh, sm = s // 2, (s % 2) * 30
-        eh, em = (e // 2) % 24, (e % 2) * 30
-        out.append((f"{sh:02d}:{sm:02d}", f"{eh:02d}:{em:02d}", t))
-    return out
+def apply_fee_model(body):
+    """解析 90 字节计费模型（0x0A 平台下发 / 0x58 平台设置），更新全局费率状态 ACTIVE_FEE。
 
-
-def print_fee_model(body):
-    """解析并打印 0x58 计费模型报文（与平台 FeeResponseBuilder 的 90 字节格式对齐：
-    桩号7B + 模型编号2B + 尖峰平谷各电费/服务费4B小端 + 计损1B + 48个半小时时段号）"""
+    报文格式（与平台 FeeResponseBuilder 对齐）：
+    桩号7B + 模型编号BCD2B + 8个费率4B小端×8（尖电/尖服/峰电/峰服/平电/平服/谷电/谷服，
+    0.00001元/度）+ 计损1B + 48个半小时时段号（0尖1峰2平3谷）
+    """
     pile = body[0:7].hex().upper()
     model = body[7:9].hex().upper()
     rates = []
@@ -519,19 +583,36 @@ def print_fee_model(body):
         ele = struct.unpack('<I', body[9 + i * 8:13 + i * 8])[0] / 100000
         srv = struct.unpack('<I', body[13 + i * 8:17 + i * 8])[0] / 100000
         rates.append((ele, srv))
+    prices = dict(zip(('sharp', 'peak', 'flat', 'valley'), rates))
     loss = body[41]
     slots = list(body[42:90])
 
+    # 48 个半小时时段号 → 合并连续区间 → [(起始分, 结束分, 类型)]
+    periods = []
+    start = 0
+    for i in range(1, 49):
+        if i == 48 or slots[i] != slots[start]:
+            periods.append((start * 30, i * 30, FEE_CODE_MAP.get(slots[start], 'flat')))
+            start = i
+
+    # 更新全局费率状态：之后的实时金额与 0x3B 账单按新模型计价
+    ACTIVE_FEE['model'] = model
+    ACTIVE_FEE['prices'] = prices
+    ACTIVE_FEE['periods'] = periods
+
+    # 打印新旧对比
     old = LAST_FEE_MODEL.get(pile)
     diff = f"（原 {old}）" if old and old != model else "（不变）" if old else "（首次）"
     print(f"  - 桩编码: {pile}")
     print(f"  - 计费模型编号: {model} {diff}")
-    for i, name in enumerate(FEE_TYPE_NAMES):
-        print(f"  - {name}: 电费 {rates[i][0]:.2f} + 服务费 {rates[i][1]:.2f} 元/度")
+    for t in ('sharp', 'peak', 'flat', 'valley'):
+        ele, srv = prices[t]
+        print(f"  - {FEE_NAME_MAP[t]}: 电费 {ele:.2f} + 服务费 {srv:.2f} = {ele + srv:.2f} 元/度")
     print(f"  - 计损比例: {loss}")
-    segs = " | ".join(f"{s}-{e} {FEE_TYPE_NAMES[t]}" for s, e, t in merge_fee_slots(slots))
-    counts = {t: slots.count(t) for t in set(slots)}
-    dist = ", ".join(f"{FEE_TYPE_NAMES[t]}×{counts[t]}" for t in sorted(counts))
+    segs = " | ".join(f"{s // 60:02d}:{s % 60:02d}-{(e // 60) % 24:02d}:{e % 60:02d} {FEE_NAME_MAP[t]}"
+                      for s, e, t in periods)
+    counts = {t: slots.count(c) for c, t in FEE_CODE_MAP.items() if c in slots}
+    dist = ", ".join(f"{FEE_NAME_MAP[t]}×{n}" for t, n in counts.items())
     print(f"  - 时段: {segs}")
     print(f"  - 分布: {dist}（共 48 个半小时）")
     LAST_FEE_MODEL[pile] = model
@@ -687,11 +768,11 @@ def stop_charging_and_report():
         end_time_bytes = pack_cp56time2a(end_dt)
         trade_time_bytes = pack_cp56time2a(now)
 
-        peak_price = 200000
-        peak_energy = int(energy * 10000)
-        peak_amount = int(peak_energy * peak_price / 100000)
-        total_energy = peak_energy
-        total_amount = peak_amount
+        # 分时账单：按时段拆电量/金额（wire 槽位顺序=尖/峰/平/谷，
+        # 对应 trade_record 参数 peak_*/sharp_*/flat_*/valley_*，与后端解析一致）
+        bill = build_tou_bill(start_dt, end_dt, energy)
+        total_energy = sum(b['energy'] for b in bill.values())
+        total_amount = sum(b['amount'] for b in bill.values())
 
         card_no = b'\xD1\x4B\x0A\x54\x00\x00\x00\x00'
         vin = b'LB37644ZMS0012345'
@@ -700,14 +781,14 @@ def stop_charging_and_report():
             trans_seq=trans_seq,
             start_time=start_time_bytes,
             end_time=end_time_bytes,
-            peak_price=peak_price, peak_energy=peak_energy,
-            peak_loss=0, peak_amount=peak_amount,
-            sharp_price=0, sharp_energy=0,
-            sharp_loss=0, sharp_amount=0,
-            flat_price=0, flat_energy=0,
-            flat_loss=0, flat_amount=0,
-            valley_price=0, valley_energy=0,
-            valley_loss=0, valley_amount=0,
+            peak_price=bill['sharp']['price'], peak_energy=bill['sharp']['energy'],
+            peak_loss=bill['sharp']['loss'], peak_amount=bill['sharp']['amount'],
+            sharp_price=bill['peak']['price'], sharp_energy=bill['peak']['energy'],
+            sharp_loss=bill['peak']['loss'], sharp_amount=bill['peak']['amount'],
+            flat_price=bill['flat']['price'], flat_energy=bill['flat']['energy'],
+            flat_loss=bill['flat']['loss'], flat_amount=bill['flat']['amount'],
+            valley_price=bill['valley']['price'], valley_energy=bill['valley']['energy'],
+            valley_loss=bill['valley']['loss'], valley_amount=bill['valley']['amount'],
             meter_start=0, meter_end=0,
             total_energy=total_energy, total_loss=0,
             total_amount=total_amount,
@@ -716,8 +797,11 @@ def stop_charging_and_report():
             stop_reason=0x40,
             card_no=card_no
         ))
+        detail = "，".join(f"{name}{bill[key]['energy'] / 10000:.2f}度/{bill[key]['amount'] / 10000:.2f}元"
+                          for key, name in (('sharp', '尖'), ('peak', '峰'), ('flat', '平'), ('valley', '谷'))
+                          if bill[key]['energy'] > 0)
         print(
-            f"✓ 上报交易记录 (0x3B): 充电时长={charge_time}分钟, 电量={energy:.2f}度, 金额={total_amount / 10000:.2f}元")
+            f"✓ 上报交易记录 (0x3B): 充电时长={charge_time}分钟, 电量={energy:.2f}度, 总金额={total_amount / 10000:.2f}元 | {detail}")
 
 
 def heartbeat_loop():
@@ -750,8 +834,8 @@ def realtime_upload_loop():
                 if is_charging:
                     charging_state['charge_time'] += 1
                     charging_state['energy'] += 0.5
-                    # 累计金额 = 电量 × 单价，与实时上报电量、0x3B 账单单价同口径
-                    charging_state['amount'] = charging_state['energy'] * PRICE_PER_KWH
+                    # 累计金额按当前所处时段的合并单价累加（0.5 度/分钟），与 0x3B 账单同口径
+                    charging_state['amount'] += 0.5 * tou_combined_price(datetime.now())
 
                 trans_seq = charging_state['trans_seq']
                 charge_time = charging_state['charge_time']
@@ -917,26 +1001,8 @@ def simulate_pile():
 
                     elif cmd == CMD_BILL_REQUEST_RESP:
                         print("✓ 收到完整计费模型 (0x0A)")
-                        if len(body) >= 42:
-                            peak_electric = struct.unpack('<I', body[9:13])[0]
-                            peak_service = struct.unpack('<I', body[13:17])[0]
-                            sharp_electric = struct.unpack('<I', body[17:21])[0]
-                            sharp_service = struct.unpack('<I', body[21:25])[0]
-                            flat_electric = struct.unpack('<I', body[25:29])[0]
-                            flat_service = struct.unpack('<I', body[29:33])[0]
-                            valley_electric = struct.unpack('<I', body[33:37])[0]
-                            valley_service = struct.unpack('<I', body[37:41])[0]
-                            loss_ratio = body[41]
-
-                            print(f"  - 尖电费: {peak_electric / 100000:.2f} 元/度")
-                            print(f"  - 尖服务费: {peak_service / 100000:.2f} 元/度")
-                            print(f"  - 峰电费: {sharp_electric / 100000:.2f} 元/度")
-                            print(f"  - 峰服务费: {sharp_service / 100000:.2f} 元/度")
-                            print(f"  - 平电费: {flat_electric / 100000:.2f} 元/度")
-                            print(f"  - 平服务费: {flat_service / 100000:.2f} 元/度")
-                            print(f"  - 谷电费: {valley_electric / 100000:.2f} 元/度")
-                            print(f"  - 谷服务费: {valley_service / 100000:.2f} 元/度")
-                            print(f"  - 计损比例: {loss_ratio}")
+                        if len(body) >= 90:
+                            apply_fee_model(body)
                         model_checked = True
 
                     elif cmd == CMD_HEARTBEAT_RESP:
@@ -1054,6 +1120,7 @@ def simulate_pile():
                                 charging_state['current'] = 2000
                                 charging_state['energy'] = 0
                                 charging_state['charge_time'] = 0
+                                charging_state['amount'] = 0.0
                             realtime_event.set()
                             print("✓ 充电状态已更新为：正在充电")
                         else:
@@ -1108,12 +1175,11 @@ def simulate_pile():
                             end_time_bytes = pack_cp56time2a(end_dt)
                             trade_time_bytes = pack_cp56time2a(now)
 
-                            peak_price = 200000
-                            peak_energy = int(energy * 10000)
-                            peak_amount = int(peak_energy * peak_price / 100000)
-
-                            total_energy = peak_energy
-                            total_amount = peak_amount
+                            # 分时账单：按时段拆电量/金额（wire 槽位顺序=尖/峰/平/谷，
+                            # 对应 trade_record 参数 peak_*/sharp_*/flat_*/valley_*，与后端解析一致）
+                            bill = build_tou_bill(start_dt, end_dt, energy)
+                            total_energy = sum(b['energy'] for b in bill.values())
+                            total_amount = sum(b['amount'] for b in bill.values())
 
                             card_no = b'\xD1\x4B\x0A\x54\x00\x00\x00\x00'
                             vin = b'LB37644ZMS0012345'
@@ -1123,14 +1189,14 @@ def simulate_pile():
                                     trans_seq=trans_seq,
                                     start_time=start_time_bytes,
                                     end_time=end_time_bytes,
-                                    peak_price=peak_price, peak_energy=peak_energy,
-                                    peak_loss=0, peak_amount=peak_amount,
-                                    sharp_price=0, sharp_energy=0,
-                                    sharp_loss=0, sharp_amount=0,
-                                    flat_price=0, flat_energy=0,
-                                    flat_loss=0, flat_amount=0,
-                                    valley_price=0, valley_energy=0,
-                                    valley_loss=0, valley_amount=0,
+                                    peak_price=bill['sharp']['price'], peak_energy=bill['sharp']['energy'],
+                                    peak_loss=bill['sharp']['loss'], peak_amount=bill['sharp']['amount'],
+                                    sharp_price=bill['peak']['price'], sharp_energy=bill['peak']['energy'],
+                                    sharp_loss=bill['peak']['loss'], sharp_amount=bill['peak']['amount'],
+                                    flat_price=bill['flat']['price'], flat_energy=bill['flat']['energy'],
+                                    flat_loss=bill['flat']['loss'], flat_amount=bill['flat']['amount'],
+                                    valley_price=bill['valley']['price'], valley_energy=bill['valley']['energy'],
+                                    valley_loss=bill['valley']['loss'], valley_amount=bill['valley']['amount'],
                                     meter_start=0, meter_end=0,
                                     total_energy=total_energy, total_loss=0,
                                     total_amount=total_amount,
@@ -1139,8 +1205,11 @@ def simulate_pile():
                                     stop_reason=0x40,
                                     card_no=card_no
                                 ))
+                            detail = "，".join(f"{name}{bill[key]['energy'] / 10000:.2f}度/{bill[key]['amount'] / 10000:.2f}元"
+                                              for key, name in (('sharp', '尖'), ('peak', '峰'), ('flat', '平'), ('valley', '谷'))
+                                              if bill[key]['energy'] > 0)
                             print(
-                                f"✓ 上报交易记录: 充电时长={charge_time}分钟, 电量={energy:.2f}度, 金额={total_amount / 10000:.2f}元")
+                                f"✓ 上报交易记录: 充电时长={charge_time}分钟, 电量={energy:.2f}度, 总金额={total_amount / 10000:.2f}元 | {detail}")
 
                     elif cmd == CMD_TRADE_CONFIRM:
                         print("✓ 收到交易记录确认 (0x40)")
@@ -1176,10 +1245,10 @@ def simulate_pile():
                     elif cmd == CMD_BILL_SET_CMD:
                         print("← 收到计费模型设置 (0x58)")
                         if len(body) >= 90:
-                            print_fee_model(body)
+                            apply_fee_model(body)
                             with send_lock:
                                 sock.send(bill_set_resp(1))
-                            print("✓ 回复计费模型设置成功")
+                            print("✓ 回复计费模型设置成功（后续账单按新费率计价）")
 
                     elif cmd == CMD_REMOTE_RESTART_CMD:
                         print("← 收到远程重启命令 (0x92)")
