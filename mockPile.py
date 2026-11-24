@@ -8,8 +8,8 @@ from datetime import datetime, timedelta
 # ---------------- 默认配置（可用命令行参数覆盖，见 --help） ----------------
 SERVER_HOST = '127.0.0.1'  # 云平台 IP
 SERVER_PORT = 8888         # 云平台端口
-# PILE_SN = b'\x77\x03\x10\x00\x00\x18\x05'  # 桩编码 BCD 7字节（示例桩号 77031000000001）
-PILE_SN=bytes.fromhex("12345678901234")
+PILE_SN = b'\x77\x03\x10\x00\x00\x18\x05'  # 桩编码 BCD 7字节（示例桩号 77031000000001）
+# PILE_SN=bytes.fromhex("12345678901234")
 GUN_COUNT = 2
 GUN_NO = 2  # 当前模拟枪号（1..GUN_COUNT）
 PROTOCOL_VER = 0x0F  # 协议版本 V1.5（0x0F）
@@ -20,8 +20,7 @@ OPERATOR = 0x04  # 其他
 
 HEARTBEAT_INTERVAL = 10  # 秒
 
-AMOUNT_INCREMENT = 0.02  # 每次递增0.10元
-MAX_AMOUNT = 2.00  # 最高不超过2.00元
+PRICE_PER_KWH = 2.0  # 实时上报电价（元/度），与 0x3B 账单 peak_price=200000（0.0001元/度）同价
 
 # 命令码（奇数上行，偶数下行）
 CMD_LOGIN = 0x01
@@ -664,7 +663,7 @@ def stop_charging_and_report():
 
     # 2. 发送充电结束帧 0x19
     if len(trans_seq) == 16 and trans_seq != b'\x00' * 16:
-        soc = 80
+        soc = min(int(energy / 40 * 100), 100)  # 与实时上报同口径：40kWh 电池模型
         min_voltage = 3800
         max_voltage = 4100
         min_temp = 15
@@ -692,7 +691,7 @@ def stop_charging_and_report():
         peak_energy = int(energy * 10000)
         peak_amount = int(peak_energy * peak_price / 100000)
         total_energy = peak_energy
-        total_amount = 800
+        total_amount = peak_amount
 
         card_no = b'\xD1\x4B\x0A\x54\x00\x00\x00\x00'
         vin = b'LB37644ZMS0012345'
@@ -751,10 +750,8 @@ def realtime_upload_loop():
                 if is_charging:
                     charging_state['charge_time'] += 1
                     charging_state['energy'] += 0.5
-                    charging_state['amount'] = min(
-                        charging_state['amount'] + AMOUNT_INCREMENT,
-                        MAX_AMOUNT
-                    )
+                    # 累计金额 = 电量 × 单价，与实时上报电量、0x3B 账单单价同口径
+                    charging_state['amount'] = charging_state['energy'] * PRICE_PER_KWH
 
                 trans_seq = charging_state['trans_seq']
                 charge_time = charging_state['charge_time']
@@ -766,15 +763,19 @@ def realtime_upload_loop():
             if is_charging:
                 energy_raw = int(energy * 10000)
                 amount_in_cents = int(amount * 10000)
+                soc = min(int(energy / 40 * 100), 100)  # 电池 40kWh 模型，每分钟充 0.5 度
+                # 剩余分钟数：按 soc 比例外推，与 soc 同口径
+                remain_time = int((100 - soc) / soc * charge_time) if soc > 0 else 0
 
                 data = upload_realtime_data(
                     trans_seq, STATUS_CHARGING,
                     is_gun_back=0, is_gun_inserted=1,
                     voltage=voltage, current=current,
-                    gun_temp=25,
-                    soc=min(int(energy * 5), 100),
+                    gun_temp=75,            # 枪线温度 25℃（1℃/位, -50℃偏移: 25+50=75）
+                    batt_max_temp=85,       # 电池最高温度 35℃（1℃/位, -50℃偏移: 35+50=85）
+                    soc=soc,
                     charge_time=charge_time,
-                    remain_time=0,
+                    remain_time=remain_time,
                     energy=energy_raw,
                     loss_energy=energy_raw,
                     amount=amount_in_cents,
@@ -950,6 +951,7 @@ def simulate_pile():
                                 voltage = 0
                                 current = 0
                                 gun_temp = 0
+                                batt_max_temp = 0
                                 soc = 0
                                 charge_time = 0
                                 energy = 0
@@ -957,18 +959,22 @@ def simulate_pile():
                                 trans_seq = charging_state['trans_seq']
                                 voltage = charging_state['voltage']
                                 current = charging_state['current']
-                                gun_temp = 25
-                                soc = min(int(charging_state['energy'] * 10), 100)
+                                gun_temp = 75            # 枪线温度 25℃（-50℃偏移）
+                                batt_max_temp = 85       # 电池最高温度 35℃（-50℃偏移）
+                                soc = min(int(charging_state['energy'] / 40 * 100), 100)  # 与周期上报同口径：40kWh 电池
                                 charge_time = charging_state['charge_time']
                                 energy = charging_state['energy']
+                                # 与周期上报同口径：soc 比例外推剩余分钟
+                                remain_time = int((100 - soc) / soc * charge_time) if soc > 0 else 0
 
                         with send_lock:
                             sock.send(upload_realtime_data(
                                 trans_seq, status,
                                 is_gun_back=1, is_gun_inserted=1,
                                 voltage=voltage, current=current,
-                                gun_temp=gun_temp, soc=soc,
-                                charge_time=charge_time, remain_time=0,
+                                gun_temp=gun_temp, batt_max_temp=batt_max_temp if status == STATUS_CHARGING else 0,
+                                soc=soc,
+                                charge_time=charge_time, remain_time=remain_time if status == STATUS_CHARGING else 0,
                                 energy=energy, loss_energy=energy,
                                 amount=0, fault=0
                             ))
@@ -1078,7 +1084,7 @@ def simulate_pile():
                         print("✓ 回复停机成功")
 
                         if len(trans_seq) == 16 and trans_seq != b'\x00' * 16:
-                            soc = 100
+                            soc = min(int(energy / 40 * 100), 100)  # 与实时上报同口径：40kWh 电池模型
                             min_voltage = 3800
                             max_voltage = 4100
                             min_temp = 15
@@ -1107,7 +1113,7 @@ def simulate_pile():
                             peak_amount = int(peak_energy * peak_price / 100000)
 
                             total_energy = peak_energy
-                            total_amount = 800
+                            total_amount = peak_amount
 
                             card_no = b'\xD1\x4B\x0A\x54\x00\x00\x00\x00'
                             vin = b'LB37644ZMS0012345'
