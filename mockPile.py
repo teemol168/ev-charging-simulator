@@ -14,7 +14,7 @@ PILE_SN = b'\x77\x03\x10\x00\x00\x18\x05'  # 桩编码 BCD 7字节（示例桩�
 # PILE_SN=bytes.fromhex("12345678901234")
 GUN_COUNT = 2
 GUN_NO = 2  # 当前模拟枪号（1..GUN_COUNT）
-PROTOCOL_VER = 0x0F  # 协议版本 V1.5（0x0F）
+PROTOCOL_VER = 0x0F  # 协议版本 V1.5（0x0F）/ V1.6（0x10），可用 --protocol 参数覆盖
 PROGRAM_VER = b'V4.1.50\x00'  # 8字节 ASCII
 NET_TYPE = 0x01  # LAN
 SIM_CARD = b'\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01'  # 10字节
@@ -1379,6 +1379,8 @@ if __name__ == "__main__":
     parser.add_argument("--pile", default=PILE_SN.hex().upper(), help="14位数字桩编码，默认 %(default)s")
     parser.add_argument("--guns", type=int, default=GUN_COUNT, help="枪数，默认 %(default)s")
     parser.add_argument("--gun", type=int, default=GUN_NO, help="当前模拟枪号，默认 %(default)s")
+    parser.add_argument("--protocol", type=float, default=PROTOCOL_VER / 10,
+                        help="云快充协议版本（1.5 或 1.6），默认 %(default)s")
     args = parser.parse_args()
 
     SERVER_HOST = args.host
@@ -1386,5 +1388,11 @@ if __name__ == "__main__":
     PILE_SN = pile_code_to_bcd(args.pile)
     GUN_COUNT = args.guns
     GUN_NO = args.gun
+    PROTOCOL_VER = int(round(args.protocol * 10))  # 版本号×10：1.5→0x0F，1.6→0x10
+    if PROTOCOL_VER not in (0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10):
+        parser.error(f"不支持的协议版本: {args.protocol}（V1.0~V1.6）")
+
+    print(f"模拟器启动: pile={PILE_SN.hex().upper()} gun={GUN_NO}/{GUN_COUNT} "
+          f"protocol=V{args.protocol} server={SERVER_HOST}:{SERVER_PORT}")
 
     simulate_pile()
