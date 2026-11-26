@@ -8,6 +8,8 @@ from datetime import datetime, timedelta
 # ---------------- 默认配置（可用命令行参数覆盖，见 --help） ----------------
 SERVER_HOST = '127.0.0.1'  # 云平台 IP
 SERVER_PORT = 8888         # 云平台端口
+# SERVER_HOST = '120.79.166.184'  # 云平台 IP
+# SERVER_PORT = 9703         # 云平台端口
 PILE_SN = b'\x77\x03\x10\x00\x00\x18\x05'  # 桩编码 BCD 7字节（示例桩号 77031000000001）
 # PILE_SN=bytes.fromhex("12345678901234")
 GUN_COUNT = 2
@@ -684,8 +686,19 @@ def pack_cp56time2a(dt):
 
 
 # 全局变量用于存储充电状态
+# 电池模型：40kWh 容量，初始 SOC 10%（与 BMS 参数配置帧 soc=100（0.1%/位）同口径）
+BATTERY_CAPACITY = 40   # 电池容量（kWh）
+INITIAL_SOC = 10        # 初始 SOC（%）
+
+
+def calc_soc(energy_kwh):
+    """按电池模型计算 SOC：初始 SOC + 已充电量占比，封顶 100%"""
+    return min(INITIAL_SOC + int(energy_kwh / BATTERY_CAPACITY * 100), 100)
+
+
 charging_state = {
     'is_charging': False,
+    'full_stop_pending': False,  # SOC 达到 100% 置位，实时上报线程发送终态帧后触发充满自停
     'trans_seq': b'\x00' * 16,
     'start_time': None,
     'voltage': 0,
@@ -721,8 +734,18 @@ def _do_send(frame: bytes):
         pass  # 主循环会检测断开并重连
 
 
-def stop_charging_and_report():
-    """手动停止充电并上报账单（通过共享 socket 发送）"""
+# 停止原因码（云快充附录 12.1，与后端 FeeEnum.StopReason 对齐）
+STOP_REASON_REMOTE = 0x40    # 结束充电，APP远程停止
+STOP_REASON_SOC_FULL = 0x41  # 结束充电，SOC达到100%
+
+
+def finish_charging_and_report(stop_reason=STOP_REASON_REMOTE, send_stop_resp=True):
+    """结束充电并上报账单（通过共享 socket 发送）。
+
+    stop_reason: 0x3B 交易记录中的停止原因码（附录 12.1）
+    send_stop_resp: 是否先回 0x35 停机应答——仅平台下发停机命令（0x36）时需要；
+                    充满自停是桩端自主停止，无平台停机命令，不发。
+    """
     global charging_state
 
     with charging_state['lock']:
@@ -731,6 +754,7 @@ def stop_charging_and_report():
             return
 
         charging_state['is_charging'] = False
+        charging_state['full_stop_pending'] = False
         realtime_event.set()
         trans_seq = charging_state['trans_seq']
         start_time = charging_state['start_time']
@@ -738,13 +762,14 @@ def stop_charging_and_report():
         charge_time = math.ceil(elapsed_seconds / 60)
         energy = charging_state['energy']
 
-    # 1. 回复停机成功
-    _do_send(remote_stop_resp(1, 0))
-    print("✓ 手动停机：回复停机成功 (0x35)")
+    # 1. 回复停机成功（仅远程停机场景）
+    if send_stop_resp:
+        _do_send(remote_stop_resp(1, 0))
+        print("✓ 手动停机：回复停机成功 (0x35)")
 
     # 2. 发送充电结束帧 0x19
     if len(trans_seq) == 16 and trans_seq != b'\x00' * 16:
-        soc = min(int(energy / 40 * 100), 100)  # 与实时上报同口径：40kWh 电池模型
+        soc = calc_soc(energy)  # 与实时上报同口径
         min_voltage = 3800
         max_voltage = 4100
         min_temp = 15
@@ -794,14 +819,19 @@ def stop_charging_and_report():
             total_amount=total_amount,
             vin=vin, trade_type=TRADE_TYPE_APP,
             trade_time=trade_time_bytes,
-            stop_reason=0x40,
+            stop_reason=stop_reason,
             card_no=card_no
         ))
         detail = "，".join(f"{name}{bill[key]['energy'] / 10000:.2f}度/{bill[key]['amount'] / 10000:.2f}元"
                           for key, name in (('sharp', '尖'), ('peak', '峰'), ('flat', '平'), ('valley', '谷'))
                           if bill[key]['energy'] > 0)
         print(
-            f"✓ 上报交易记录 (0x3B): 充电时长={charge_time}分钟, 电量={energy:.2f}度, 总金额={total_amount / 10000:.2f}元 | {detail}")
+            f"✓ 上报交易记录 (0x3B): 充电时长={charge_time}分钟, 电量={energy:.2f}度, 总金额={total_amount / 10000:.2f}元, 停止原因=0x{stop_reason:02X} | {detail}")
+
+
+def stop_charging_and_report():
+    """手动停止充电并上报账单：回 0x35 应答 + 结束流程（平台停机命令场景）"""
+    finish_charging_and_report(stop_reason=STOP_REASON_REMOTE, send_stop_resp=True)
 
 
 def heartbeat_loop():
@@ -836,6 +866,11 @@ def realtime_upload_loop():
                     charging_state['energy'] += 0.5
                     # 累计金额按当前所处时段的合并单价累加（0.5 度/分钟），与 0x3B 账单同口径
                     charging_state['amount'] += 0.5 * tou_combined_price(datetime.now())
+                    # SOC 达到 100%（40kWh 电池模型）：置位充满自停标记，
+                    # 本轮先发出 SOC=100 的终态实时帧，随后触发结束流程
+                    if charging_state['energy'] >= BATTERY_CAPACITY * (100 - INITIAL_SOC) / 100:
+                        # 从初始 SOC 10% 充到 100% 只需 36 度（40kWh × 90%）
+                        charging_state['full_stop_pending'] = True
 
                 trans_seq = charging_state['trans_seq']
                 charge_time = charging_state['charge_time']
@@ -847,9 +882,9 @@ def realtime_upload_loop():
             if is_charging:
                 energy_raw = int(energy * 10000)
                 amount_in_cents = int(amount * 10000)
-                soc = min(int(energy / 40 * 100), 100)  # 电池 40kWh 模型，每分钟充 0.5 度
-                # 剩余分钟数：按 soc 比例外推，与 soc 同口径
-                remain_time = int((100 - soc) / soc * charge_time) if soc > 0 else 0
+                soc = calc_soc(energy)  # 电池 40kWh 模型，每 5 秒充 0.5 度
+                # 剩余分钟数：按已充百分比线性外推，与 soc 同口径
+                remain_time = int((100 - soc) / (soc - INITIAL_SOC) * charge_time) if soc > INITIAL_SOC else 0
 
                 data = upload_realtime_data(
                     trans_seq, STATUS_CHARGING,
@@ -868,6 +903,13 @@ def realtime_upload_loop():
                 timeout = 5
                 print(
                     f"[{datetime.now().strftime('%H:%M:%S')}] 上报实时数据: 充电中 | 时间={charge_time}min, 电量={energy:.2f}度")
+
+                # 充满自停：终态实时帧（SOC=100）已发出，紧接 0x19 结束帧 + 0x3B 交易记录。
+                # 桩端自主停止，无平台停机命令，不回 0x35 应答
+                if charging_state['full_stop_pending']:
+                    print("⚡ SOC 已达 100%，触发充满自停流程...")
+                    finish_charging_and_report(stop_reason=STOP_REASON_SOC_FULL, send_stop_resp=False)
+                    continue  # 下一轮直接走待机帧分支
             else:
                 data = upload_realtime_data(
                     b'\x00' * 16, STATUS_IDLE,
@@ -1027,11 +1069,11 @@ def simulate_pile():
                                 current = charging_state['current']
                                 gun_temp = 75            # 枪线温度 25℃（-50℃偏移）
                                 batt_max_temp = 85       # 电池最高温度 35℃（-50℃偏移）
-                                soc = min(int(charging_state['energy'] / 40 * 100), 100)  # 与周期上报同口径：40kWh 电池
+                                soc = calc_soc(charging_state['energy'])  # 与周期上报同口径
                                 charge_time = charging_state['charge_time']
                                 energy = charging_state['energy']
                                 # 与周期上报同口径：soc 比例外推剩余分钟
-                                remain_time = int((100 - soc) / soc * charge_time) if soc > 0 else 0
+                                remain_time = int((100 - soc) / (soc - INITIAL_SOC) * charge_time) if soc > INITIAL_SOC else 0
 
                         with send_lock:
                             sock.send(upload_realtime_data(
@@ -1114,6 +1156,7 @@ def simulate_pile():
 
                             with charging_state['lock']:
                                 charging_state['is_charging'] = True
+                                charging_state['full_stop_pending'] = False  # 新充电会话复位充满自停标记
                                 charging_state['trans_seq'] = trans_seq
                                 charging_state['start_time'] = time.time()
                                 charging_state['voltage'] = voltage
@@ -1151,7 +1194,7 @@ def simulate_pile():
                         print("✓ 回复停机成功")
 
                         if len(trans_seq) == 16 and trans_seq != b'\x00' * 16:
-                            soc = min(int(energy / 40 * 100), 100)  # 与实时上报同口径：40kWh 电池模型
+                            soc = calc_soc(energy)  # 与实时上报同口径
                             min_voltage = 3800
                             max_voltage = 4100
                             min_temp = 15
